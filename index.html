@@ -486,7 +486,15 @@ async function runJob(job){
   if (S.jobs.indexOf(job) < 0) S.jobs.push(job);
   job.status = 'run'; job.err = ''; renderJobs();
   try {
-    const tasks = await api('tasks.parse', { text: job.text, today: localToday() });
+    let tasks;
+    if (job.audio){
+      const r = await api('tasks.parseAudio', { audio: job.audio, today: localToday() });
+      if (!r.transcript) throw mkErr('EMPTY', '말소리를 알아듣지 못했습니다. 조금 더 또렷하게 다시 녹음해 주세요.');
+      job.text = r.transcript; job.label = '🎤 ' + r.transcript; job.audio = null;   // 이후 재시도·고쳐 쓰기는 글자로
+      tasks = r.tasks;
+    } else {
+      tasks = await api('tasks.parse', { text: job.text, today: localToday() });
+    }
     if (!tasks.length) throw mkErr('EMPTY', '할 일을 찾지 못했습니다. 조금 더 구체적으로 적어 주세요.');
     tasks.forEach(t => t._raw = job.text);
     if (S.autoSave){
@@ -503,9 +511,9 @@ async function runJob(job){
 function renderJobs(){
   const el = $('#jobs'); if (!el) return;
   el.innerHTML = S.jobs.map(j => j.status === 'run'
-    ? `<div class="job"><span class="spinner"></span><span class="txt">정리 중: ${esc(j.text)}</span></div>`
-    : `<div class="job err"><span>⚠️</span><span class="txt" title="${esc(j.err)}">${esc(j.err)} — ${esc(j.text)}</span>
-        <button data-act="jretry" data-i="${j.id}">다시 시도</button><button data-act="jedit" data-i="${j.id}">고쳐 쓰기</button>
+    ? `<div class="job"><span class="spinner"></span><span class="txt">${j.audio ? '받아쓰고 정리 중' : '정리 중'}: ${esc(j.label || j.text)}</span></div>`
+    : `<div class="job err"><span>⚠️</span><span class="txt" title="${esc(j.err)}">${esc(j.err)} — ${esc(j.label || j.text)}</span>
+        <button data-act="jretry" data-i="${j.id}">다시 시도</button>${j.text ? `<button data-act="jedit" data-i="${j.id}">고쳐 쓰기</button>` : ''}
         <button class="ghost" data-act="jdrop" data-i="${j.id}" title="버리기">×</button></div>`).join('');
 }
 
@@ -567,19 +575,12 @@ async function act(action, id, okMsg){
 }
 
 /* ════════ 음성 입력 ════════ */
-/* 상태를 입력창 아래에 바로 보여 주고(듣는 중/인식 중/문제 원인),
- * 버튼 둘레의 붉은 테두리로 마이크 소리 크기를 표시합니다.
- * 멈춤은 누르는 즉시 화면에 반영하고, 인식기가 응답하지 않으면 강제로 끝냅니다. */
+/* 브라우저 음성인식(구글 서버)에 의존하지 않고, 녹음한 소리를 우리 서버 → Gemini로 보내
+ * 받아쓰기와 할 일 정리를 한 번에 합니다. Chrome·Safari·데스크톱 앱 어디서나 같은 방식으로 동작합니다.
+ * 녹음은 16kHz 모노 WAV로 줄여 보내므로 1분에 약 2.5MB입니다. */
+const MIC_MAX_SEC = 90;
 const MIC_FALLBACK = '입력창에 커서를 둔 채 운영체제 받아쓰기를 쓰셔도 됩니다 (맥: 시스템 설정 → 키보드 → 받아쓰기 / 윈도우: Win+H).';
-const MIC_ERRORS = {
-  'not-allowed': '마이크 권한이 차단되어 있습니다. 주소창 왼쪽 아이콘 → 마이크 「허용」으로 바꾼 뒤 새로고침하세요.',
-  'service-not-allowed': '이 브라우저에서 음성인식 서비스를 쓸 수 없습니다. ' + MIC_FALLBACK,
-  'audio-capture': '마이크 장치를 찾지 못했습니다. Chrome 설정 → 개인정보 보호 및 보안 → 사이트 설정 → 마이크에서 장치를 확인하세요.',
-  'network': '구글 음성인식 서버에 연결하지 못했습니다. VPN·방화벽·광고 차단 확장 프로그램을 확인하세요. ' + MIC_FALLBACK,
-  'no-speech': '말소리가 감지되지 않아 멈췄습니다. 다시 🎤를 누르고 말씀해 주세요.',
-  'language-not-supported': '한국어 음성인식을 지원하지 않는 환경입니다. ' + MIC_FALLBACK
-};
-const mic = { rec:null, stream:null, ctx:null, raf:0, watch:0, peak:0, gotResult:false };
+const mic = { on:false, stream:null, ctx:null, src:null, node:null, chunks:[], rate:48000, peak:0, level:0, t0:0, timer:0 };
 
 function micStatus(text, isErr){
   const el = $('#micStatus'); if (!el) return;
@@ -587,84 +588,91 @@ function micStatus(text, isErr){
   el.style.display = text ? 'block' : 'none';
   el.style.color = isErr ? 'var(--red)' : '';
 }
-function micButton(on){
-  const btn = $('#mic'); if (!btn) return;
-  btn.classList.toggle('on', on); btn.textContent = on ? '■ 멈춤' : '🎤'; btn.style.boxShadow = '';
-}
-function stopMeter(){
-  cancelAnimationFrame(mic.raf); clearTimeout(mic.watch);
-  if (mic.stream){ mic.stream.getTracks().forEach(t => t.stop()); mic.stream = null; }
-  if (mic.ctx){ try { mic.ctx.close(); } catch(e){} mic.ctx = null; }
-}
-async function startMeter(){
+function fmtSec(s){ s = Math.floor(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+async function toggleMic(){
+  if (mic.on) return finishRecording();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return micStatus('이 브라우저는 녹음을 지원하지 않습니다. ' + MIC_FALLBACK, true);
   try {
-    mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mic.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const an = mic.ctx.createAnalyser(); an.fftSize = 512;
-    mic.ctx.createMediaStreamSource(mic.stream).connect(an);
-    const buf = new Uint8Array(an.fftSize);
-    const loop = () => {
-      an.getByteTimeDomainData(buf);
-      let m = 0; for (let i = 0; i < buf.length; i++) m = Math.max(m, Math.abs(buf[i] - 128));
-      mic.peak = Math.max(mic.peak, m);
-      const btn = $('#mic'); if (btn) btn.style.boxShadow = `0 0 0 ${Math.min(10, m / 5).toFixed(1)}px rgba(220,38,38,.35)`;
-      mic.raf = requestAnimationFrame(loop);
-    };
-    loop();
-  } catch(e){ /* 권한·장치 문제는 인식기 오류로도 함께 보고됨 */ }
-}
-
-function stopMic(msg, isErr){
-  const r = mic.rec; mic.rec = null;
-  if (r){
-    try { r.stop(); } catch(e){}                                   // 마지막 결과까지 받기
-    setTimeout(() => { try { r.abort(); } catch(e){} }, 1500);      // 응답이 없으면 강제 종료
+    mic.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch(e){
+    const why = e.name === 'NotAllowedError' ? '마이크 권한이 차단되어 있습니다. 주소창 왼쪽 아이콘 → 마이크 「허용」 후 새로고침하세요.'
+      : e.name === 'NotFoundError' ? '마이크 장치를 찾지 못했습니다.' : '마이크를 열 수 없습니다(' + e.name + ').';
+    return micStatus(why + ' ' + MIC_FALLBACK, true);
   }
-  micButton(false); micStatus(msg || '', isErr);
-  try { stopMeter(); } catch(e){}
+  try {
+    mic.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (mic.ctx.state === 'suspended') await mic.ctx.resume();
+    mic.rate = mic.ctx.sampleRate;
+    mic.src = mic.ctx.createMediaStreamSource(mic.stream);
+    mic.node = mic.ctx.createScriptProcessor(4096, 1, 1);
+    mic.chunks = []; mic.peak = 0; mic.level = 0;
+    mic.node.onaudioprocess = ev => {
+      if (!mic.on) return;
+      const d = ev.inputBuffer.getChannelData(0);
+      mic.chunks.push(new Float32Array(d));
+      let m = 0; for (let i = 0; i < d.length; i += 8) m = Math.max(m, Math.abs(d[i]));
+      mic.level = m; mic.peak = Math.max(mic.peak, m);
+    };
+    mic.src.connect(mic.node); mic.node.connect(mic.ctx.destination);
+  } catch(e){ releaseMic(); return micStatus('녹음을 시작하지 못했습니다. ' + MIC_FALLBACK, true); }
+
+  mic.on = true; mic.t0 = Date.now();
+  micStatus('녹음 중… 말씀하세요. 다 말했으면 「■ 멈춤」을 누르세요. (최대 ' + MIC_MAX_SEC + '초)');
+  const tick = () => {
+    if (!mic.on) return;
+    const btn = $('#mic');
+    if (btn){
+      btn.classList.add('on');
+      btn.textContent = '■ 멈춤 ' + fmtSec((Date.now() - mic.t0) / 1000);
+      btn.style.boxShadow = `0 0 0 ${Math.min(10, mic.level * 40).toFixed(1)}px rgba(220,38,38,.35)`;
+    }
+    if (Date.now() - mic.t0 >= MIC_MAX_SEC * 1000) return finishRecording();
+    mic.timer = setTimeout(tick, 100);
+  };
+  tick();
 }
 
-function toggleMic(){
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const ta = $('#inp');
-  if (mic.rec) return stopMic('');
-  if (!SR){ ta.focus(); return micStatus('이 브라우저는 음성 입력을 지원하지 않습니다. ' + MIC_FALLBACK, true); }
+function releaseMic(){
+  mic.on = false; clearTimeout(mic.timer);
+  try { if (mic.node){ mic.node.onaudioprocess = null; mic.node.disconnect(); } if (mic.src) mic.src.disconnect(); } catch(e){}
+  if (mic.stream) mic.stream.getTracks().forEach(t => t.stop());
+  if (mic.ctx){ try { mic.ctx.close(); } catch(e){} }
+  mic.stream = mic.ctx = mic.src = mic.node = null;
+  const btn = $('#mic'); if (btn){ btn.classList.remove('on'); btn.textContent = '🎤'; btn.style.boxShadow = ''; }
+}
 
-  const r = new SR(); mic.rec = r; mic.peak = 0; mic.gotResult = false;
-  r.lang = 'ko-KR'; r.interimResults = true; r.continuous = true;
-  const base = ta.value ? ta.value.replace(/\s*$/, ' ') : '';
-  let finalText = '';
+function finishRecording(){
+  const secs = (Date.now() - mic.t0) / 1000, chunks = mic.chunks, rate = mic.rate, peak = mic.peak;
+  mic.chunks = [];
+  releaseMic();
+  if (secs < 0.8) return micStatus('너무 짧습니다. 🎤를 누르고 말한 뒤 「■ 멈춤」을 눌러 주세요.', true);
+  if (peak < 0.01) return micStatus('소리가 거의 녹음되지 않았습니다. 맥 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Chrome이 켜져 있는지, 입력 장치가 맞는지 확인하세요.', true);
+  micStatus('');
+  runJob({ id: ++S.jobSeq, text: '', label: '🎤 음성 ' + fmtSec(secs), audio: encodeWavBase64(chunks, rate, Math.min(16000, rate)), status: 'run', err: '' });
+}
 
-  r.onaudiostart = () => { if (mic.rec === r) micStatus('듣는 중… 말씀하세요. 다 말했으면 「■ 멈춤」을 누르세요.'); };
-  r.onspeechstart = () => { if (mic.rec === r) micStatus('말소리 인식 중…'); };
-  r.onresult = ev => {
-    mic.gotResult = true;
-    let interim = '';
-    for (let i = ev.resultIndex; i < ev.results.length; i++){
-      const x = ev.results[i]; if (x.isFinal) finalText += x[0].transcript; else interim += x[0].transcript;
-    }
-    ta.value = base + finalText + interim;
-  };
-  r.onerror = ev => {
-    if (ev.error === 'aborted') return;
-    stopMic(MIC_ERRORS[ev.error] || ('음성 인식 오류(' + ev.error + '). ' + MIC_FALLBACK), ev.error !== 'no-speech');
-  };
-  r.onend = () => { if (mic.rec === r) stopMic(''); };
-
-  try { r.start(); } catch(e){ mic.rec = null; return micStatus('음성 입력을 시작할 수 없습니다. ' + MIC_FALLBACK, true); }
-  micButton(true); micStatus('마이크 준비 중…');
-  startMeter();
-
-  // 6초 뒤에도 결과가 없으면 원인을 짚어 줌
-  mic.watch = setTimeout(() => {
-    if (mic.rec !== r || mic.gotResult) return;
-    if (mic.stream && mic.peak < 3) {
-      micStatus('마이크에 소리가 들어오지 않습니다. 맥 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Google Chrome이 켜져 있는지, ' +
-                'Chrome 설정의 마이크 장치가 맞는지 확인하세요.', true);
-    } else if (mic.stream) {
-      micStatus('소리는 들어오는데 인식 결과가 없습니다. 구글 음성인식 서버 연결 문제일 수 있습니다. 잠시 후 다시 시도하거나, ' + MIC_FALLBACK, true);
-    }
-  }, 6000);
+/** Float32 조각들 → 16kHz 16bit 모노 WAV → base64 */
+function encodeWavBase64(chunks, inRate, outRate){
+  let len = 0; chunks.forEach(c => len += c.length);
+  const all = new Float32Array(len); let off = 0;
+  chunks.forEach(c => { all.set(c, off); off += c.length; });
+  const ratio = inRate / outRate, outLen = Math.floor(len / ratio);
+  const buf = new ArrayBuffer(44 + outLen * 2), dv = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + outLen * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, outRate, true); dv.setUint32(28, outRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, 'data'); dv.setUint32(40, outLen * 2, true);
+  for (let i = 0; i < outLen; i++){
+    const s = Math.floor(i * ratio), e = Math.max(s + 1, Math.min(len, Math.floor((i + 1) * ratio)));
+    let sum = 0; for (let j = s; j < e; j++) sum += all[j];
+    const v = Math.max(-1, Math.min(1, sum / (e - s)));
+    dv.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
+  }
+  const bytes = new Uint8Array(buf); let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
 
 /* ════════ 사용자 · 초대 ════════ */
