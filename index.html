@@ -144,13 +144,20 @@ function isAdmin(){ return me().role === '관리자'; }
 
 /* ════════ 서버 호출 ════════
  * CORS 사전 확인을 피하려고 text/plain으로 보내고, 토큰은 본문에 넣습니다. */
-async function api(action, params){
+async function api(action, params, timeoutMs){
   const body = Object.assign({ action }, params || {});
   if (S.token) body.token = S.token;
   let res, j;
   try {
-    res = await fetch(API_URL, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' }, body: JSON.stringify(body) });
-  } catch(e){ throw mkErr('NETWORK', '서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.'); }
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs || 60000);   // 응답이 없으면 무한정 기다리지 않음
+    try {
+      res = await fetch(API_URL, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' }, body: JSON.stringify(body), signal: ac.signal });
+    } finally { clearTimeout(to); }
+  } catch(e){
+    if (e && e.name === 'AbortError') throw mkErr('TIMEOUT', '서버 응답이 너무 오래 걸려 중단했습니다. 「다시 시도」를 눌러 주세요.');
+    throw mkErr('NETWORK', '서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.');
+  }
   try { j = await res.json(); }
   catch(e){ throw mkErr('SERVER', '서버 응답을 읽지 못했습니다. API 주소와 배포 설정(액세스: 누구나)을 확인하세요.'); }
   if (j.v && j.v !== APP_API_VERSION) showVersionBanner();
@@ -484,16 +491,17 @@ function submitInput(){
 
 async function runJob(job){
   if (S.jobs.indexOf(job) < 0) S.jobs.push(job);
-  job.status = 'run'; job.err = ''; renderJobs();
+  job.status = 'run'; job.err = ''; job.started = Date.now(); renderJobs();
+  if (!S.jobTick) S.jobTick = setInterval(() => { if (S.jobs.some(j => j.status === 'run')) renderJobs(); }, 1000);
   try {
     let tasks;
     if (job.audio){
-      const r = await api('tasks.parseAudio', { audio: job.audio, today: localToday() });
+      const r = await api('tasks.parseAudio', { audio: job.audio, today: localToday() }, 120000);
       if (!r.transcript) throw mkErr('EMPTY', '말소리를 알아듣지 못했습니다. 조금 더 또렷하게 다시 녹음해 주세요.');
       job.text = r.transcript; job.label = '🎤 ' + r.transcript; job.audio = null;   // 이후 재시도·고쳐 쓰기는 글자로
       tasks = r.tasks;
     } else {
-      tasks = await api('tasks.parse', { text: job.text, today: localToday() });
+      tasks = await api('tasks.parse', { text: job.text, today: localToday() }, 90000);
     }
     if (!tasks.length) throw mkErr('EMPTY', '할 일을 찾지 못했습니다. 조금 더 구체적으로 적어 주세요.');
     tasks.forEach(t => t._raw = job.text);
@@ -511,7 +519,7 @@ async function runJob(job){
 function renderJobs(){
   const el = $('#jobs'); if (!el) return;
   el.innerHTML = S.jobs.map(j => j.status === 'run'
-    ? `<div class="job"><span class="spinner"></span><span class="txt">${j.audio ? '받아쓰고 정리 중' : '정리 중'}: ${esc(j.label || j.text)}</span></div>`
+    ? `<div class="job"><span class="spinner"></span><span class="txt">${j.audio ? '받아쓰고 정리 중' : '정리 중'} (${Math.floor((Date.now() - (j.started || Date.now())) / 1000)}초): ${esc(j.label || j.text)}</span></div>`
     : `<div class="job err"><span>⚠️</span><span class="txt" title="${esc(j.err)}">${esc(j.err)} — ${esc(j.label || j.text)}</span>
         <button data-act="jretry" data-i="${j.id}">다시 시도</button>${j.text ? `<button data-act="jedit" data-i="${j.id}">고쳐 쓰기</button>` : ''}
         <button class="ghost" data-act="jdrop" data-i="${j.id}" title="버리기">×</button></div>`).join('');
